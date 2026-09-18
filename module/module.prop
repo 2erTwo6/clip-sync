@@ -1,0 +1,6 @@
+id=clipsync
+name=Clip Sync
+version=0.1.0
+versionCode=1
+author=assistant
+description=Sync text clipboard between Android and PC over TCP. Runs a native binary as a KernelSU service.
