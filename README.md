@@ -58,8 +58,13 @@ vi /data/adb/modules/clipsync/clipsync.conf
 ```ini
 host=192.168.31.92
 port=52345
-poll_ms=300
+# 手机剪贴板轮询间隔（默认 3000 ms）
+poll_ms=3000
 ```
+
+> 升级旧模块后，如果已有 `clipsync.conf` 里是 `poll_ms=300`，`service.sh` 会自动改成
+> `poll_ms=3000`。PC 端和 Android 端需要一起更新；新协议使用 `TEXT_TS`，旧 PC 端
+> 不会理解手机发来的带时间戳文本。
 
 重启，或手动启动：
 
@@ -85,9 +90,46 @@ su -c '/data/adb/modules/clipsync/bin/clipsync --set "hello from phone"'
 - Android 端以 uid 2000 (`com.android.shell`) 的身份直接读写 binder `clipboard` 服务，
   因此能稳定读取 Android 15/16 的剪贴板。
 - PC 端通过 `wl-paste` / `wl-copy`（或 `xclip`）读写剪贴板。
-- 两端轮询本地剪贴板，变化后通过简单 TCP 协议发送 `TEXT` 消息；
-  收到远端 `TEXT` 后写回本地，并通过“最近发送/最近接收”去重避免回环。
-- 剪贴板读取失败、PC 重启、网络短暂断开后会自动重试。
+- 两端轮询本地剪贴板（Android 默认 3 秒，PC 默认 300 ms），变化后通过简单 TCP 协议
+  发送带时间戳的 `TEXT_TS` 消息；收到远端消息后先比较时间戳，较新的内容才覆盖本地，
+  再通过“最近发送/最近接收”去重避免回环。
+- 同步状态会跨 TCP 会话保留，避免手机重新连上 WiFi 时两边盲目互发旧剪贴板。
+- 双方每 5 秒发送一次应用层心跳，15 秒收不到任何数据就主动断开重连；同时已启用
+  `SO_KEEPALIVE`，用于兜底检测半开连接。
+- 手机端连接失败时按 1/2/4/…/10 秒退避重试；PC 重启、网络短暂断开后会自动恢复。
+
+## 让 PC 端可靠地自动恢复
+
+这个项目本身不会帮你保证 PC 的 IP 不变，也不会自动把 PC 端进程拉起来。要做到
+“回家连上 WiFi 后自动同步”和“第二天开机后自动同步”，建议：
+
+1. 在路由器里给 PC 设置 **DHCP 保留地址**，或给 PC 配固定局域网 IP；
+2. 把手机配置里的 `host` 改成这个固定 IP；
+3. 让 `clipsync_pc` 随桌面会话自动启动。Wayland 下它需要继承图形会话环境变量。
+
+Wayland 用户级 systemd 示例（放在 `~/.config/systemd/user/clipsync.service`）：
+
+```ini
+[Unit]
+Description=Clip Sync PC
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/clip-sync/dist/clipsync_pc --listen 0.0.0.0:52345 --poll-ms 1000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now clipsync.service
+```
+
+如果 PC 的 IP 会变，当前协议没有局域网发现能力，手机端会一直尝试旧 IP，无法自动找到
+新地址。
 
 ## 构建
 

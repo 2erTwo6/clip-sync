@@ -3,4 +3,4 @@ host=192.168.31.92
 port=52345
 
 # How often the phone checks its local clipboard, in milliseconds.
-poll_ms=300
+poll_ms=3000

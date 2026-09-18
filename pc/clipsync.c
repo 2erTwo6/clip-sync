@@ -11,9 +11,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define HEARTBEAT_INTERVAL_MS 5000u
+#define HEARTBEAT_TIMEOUT_MS 15000u
+#define TEXT_TS_OVERHEAD 8u
+
 struct state {
     int fd;
     int poll_ms;
+    int prefer_local_on_tie; /* PC = 1, Android = 0; used for equal timestamps */
+    int local_seen;
+    int pending_send;
+    uint64_t local_ts;
+    uint64_t last_remote_ts;
+    uint64_t last_rx_ms;
+    uint64_t last_ping_ms;
     uint8_t *last_local;
     size_t last_local_len;
     uint8_t *last_remote;
@@ -120,19 +131,45 @@ static int same_text(const uint8_t *a, size_t alen, const uint8_t *b, size_t ble
     return alen == blen && (alen == 0 || memcmp(a, b, alen) == 0);
 }
 
-static int send_text(struct state *st, const uint8_t *data, size_t len) {
-    if (len == 0 || len > CLIPSYNC_MAX_PAYLOAD) return 0;
-    if (net_send_msg(st->fd, CLIPSYNC_MSG_TEXT, data, (uint32_t)len) < 0) return -1;
-    fprintf(stderr, "pc -> phone: %zu bytes\n", len);
-    return 0;
+static int send_text(struct state *st, const uint8_t *data, size_t len, uint64_t ts) {
+    if (len == 0) return 0;
+    if (len > CLIPSYNC_MAX_PAYLOAD - TEXT_TS_OVERHEAD) return 0;
+    uint8_t *buf = malloc(TEXT_TS_OVERHEAD + len);
+    if (!buf) return -1;
+    net_put_be64(buf, ts);
+    memcpy(buf + TEXT_TS_OVERHEAD, data, len);
+    int r = net_send_msg(st->fd, CLIPSYNC_MSG_TEXT_TS, buf,
+                         (uint32_t)(TEXT_TS_OVERHEAD + len));
+    free(buf);
+    if (r == 0)
+        fprintf(stderr, "pc -> phone: %zu bytes (ts=%llu)\n",
+                len, (unsigned long long)ts);
+    return r;
 }
 
-static int send_local_if_changed(struct state *st) {
+/* Read the local clipboard and update state.  Returns:
+   -2 : clipboard backend unavailable
+    0 : no change
+    1 : local content changed and must be sent to the peer */
+static int refresh_local_state(struct state *st) {
     uint8_t *cur = NULL;
     size_t curlen = 0;
-    if (pc_clip_get(&cur, &curlen) < 0) return -1;
-    if (curlen == 0) { free(cur); return 0; }
+    if (pc_clip_get(&cur, &curlen) < 0) return -2;
+    int first = !st->local_seen;
+    st->local_seen = 1;
+
+    if (curlen == 0) {
+        state_set_memory(&st->last_local, &st->last_local_len, NULL, 0);
+        st->pending_send = 0;
+        free(cur);
+        return 0;
+    }
     if (st->last_remote && same_text(cur, curlen, st->last_remote, st->last_remote_len)) {
+        if (!(st->last_local && same_text(cur, curlen, st->last_local, st->last_local_len))) {
+            state_set_memory(&st->last_local, &st->last_local_len, cur, curlen);
+            st->local_ts = st->last_remote_ts;
+        }
+        st->pending_send = 0;
         free(cur);
         return 0;
     }
@@ -140,79 +177,165 @@ static int send_local_if_changed(struct state *st) {
         free(cur);
         return 0;
     }
+
+    uint64_t ts = first ? 0 : net_now_ms();
+    st->local_ts = ts;
     state_set_memory(&st->last_local, &st->last_local_len, cur, curlen);
-    int r = send_text(st, cur, curlen);
+    st->pending_send = 1;
     free(cur);
+    return 1;
+}
+
+static int send_current_local(struct state *st) {
+    if (!st->last_local || st->last_local_len == 0) {
+        st->pending_send = 0;
+        return 0;
+    }
+    int r = send_text(st, st->last_local, st->last_local_len, st->local_ts);
+    if (r == 0) st->pending_send = 0;
     return r;
 }
 
-static int handle_text_from_phone(struct state *st, uint8_t *payload, uint32_t len) {
+static int send_local_if_changed(struct state *st) {
+    int r = refresh_local_state(st);
+    if (r == -2) return -2; /* clipboard backend error */
+    if (r == 0 && !st->pending_send) return 0;
+    return send_current_local(st);
+}
+
+static int handle_text_from_phone(struct state *st, uint64_t ts,
+                                  const uint8_t *text, size_t len) {
     if (len == 0) return 0;
-    if (pc_clip_set(payload, len) < 0) {
-        fprintf(stderr, "failed to set local clipboard\n");
-        return -1;
+
+    /* If the user copied something on the PC just before this packet
+       arrived, make sure its newer timestamp is considered. */
+    int rr = refresh_local_state(st);
+    if (rr == 1) {
+        if (send_current_local(st) < 0) return -1;
     }
-    state_set_memory(&st->last_remote, &st->last_remote_len, payload, len);
-    state_set_memory(&st->last_local, &st->last_local_len, payload, len);
-    fprintf(stderr, "phone -> pc: %u bytes\n", len);
+
+    if (st->last_local && same_text(st->last_local, st->last_local_len, text, len)) {
+        state_set_memory(&st->last_remote, &st->last_remote_len, text, len);
+        st->last_remote_ts = ts;
+        return 0;
+    }
+
+    int accept;
+    if (!st->last_local || st->last_local_len == 0) {
+        accept = 1;
+    } else if (ts > st->local_ts) {
+        accept = 1;
+    } else if (ts < st->local_ts) {
+        accept = 0;
+    } else {
+        /* Equal timestamp and different content: PC wins on tie. */
+        accept = !st->prefer_local_on_tie;
+    }
+
+    if (!accept && st->last_local && st->last_local_len) {
+        /* Keep PC's value and make sure the phone receives it too. */
+        if (send_current_local(st) < 0) return -1;
+    }
+
+    if (accept) {
+        if (pc_clip_set(text, len) < 0) {
+            fprintf(stderr, "failed to set local clipboard\n");
+            return -1;
+        }
+        state_set_memory(&st->last_remote, &st->last_remote_len, text, len);
+        state_set_memory(&st->last_local, &st->last_local_len, text, len);
+        st->local_ts = ts;
+        st->last_remote_ts = ts;
+        st->pending_send = 0;
+        fprintf(stderr, "phone -> pc: %zu bytes (ts=%llu)\n",
+                len, (unsigned long long)ts);
+    } else {
+        state_set_memory(&st->last_remote, &st->last_remote_len, text, len);
+        st->last_remote_ts = ts;
+        fprintf(stderr, "ignored older phone text (ts=%llu < %llu)\n",
+                (unsigned long long)ts, (unsigned long long)st->local_ts);
+    }
     return 0;
 }
 
-static int handle_connection(int fd, int poll_ms) {
-    struct state st;
-    memset(&st, 0, sizeof(st));
-    st.fd = fd;
-    st.poll_ms = poll_ms;
+static int handle_connection(int fd, struct state *st) {
+    st->fd = fd;
     net_set_timeout(fd, 10);
 
-    uint8_t ver[4] = {0, 0, 0, 1};
+    uint8_t ver[4] = {0, 0, 0, 2};
     if (net_send_msg(fd, CLIPSYNC_MSG_HELLO, ver, sizeof(ver)) < 0) return -1;
-    if (send_local_if_changed(&st) < 0) {
-        /* Clipboard backend may be missing; continue anyway. */
-        fprintf(stderr, "warning: unable to read local clipboard\n");
-    }
+    st->last_rx_ms = net_now_ms();
+    st->last_ping_ms = st->last_rx_ms;
+
+    int sr = send_local_if_changed(st);
+    if (sr == -1) return -1;
+    if (sr == -2) fprintf(stderr, "warning: unable to read local clipboard\n");
 
     for (;;) {
+        int sr2 = send_local_if_changed(st);
+        if (sr2 == -1) return -1;
+
+        uint64_t now = net_now_ms();
+        if (now - st->last_rx_ms > HEARTBEAT_TIMEOUT_MS) {
+            fprintf(stderr, "heartbeat timeout\n");
+            return -1;
+        }
+        if (now - st->last_ping_ms >= HEARTBEAT_INTERVAL_MS) {
+            if (net_send_msg(fd, CLIPSYNC_MSG_PING, NULL, 0) < 0) return -1;
+            st->last_ping_ms = now;
+        }
+
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLIN;
         pfd.revents = 0;
-        int pr = poll(&pfd, 1, st.poll_ms);
+        int pr = poll(&pfd, 1, st->poll_ms);
         if (pr < 0) {
             if (errno == EINTR) continue;
-            break;
+            return -1;
         }
         if (pr > 0) {
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
             if (pfd.revents & POLLIN) {
                 uint32_t type = 0, len = 0;
                 uint8_t *payload = NULL;
                 int r = net_recv_msg(fd, &type, &payload, &len);
-                if (r < 0) break;
-                int keep = 1;
-                if (type == CLIPSYNC_MSG_TEXT) {
-                    if (handle_text_from_phone(&st, payload, len) < 0) keep = 0;
+                if (r < 0) return -1;
+                st->last_rx_ms = net_now_ms();
+
+                if (type == CLIPSYNC_MSG_TEXT_TS) {
+                    if (len < TEXT_TS_OVERHEAD) {
+                        free(payload);
+                        return -1;
+                    }
+                    uint64_t ts = net_get_be64(payload);
+                    if (handle_text_from_phone(st, ts, payload + TEXT_TS_OVERHEAD,
+                                               len - TEXT_TS_OVERHEAD) < 0) {
+                        free(payload);
+                        return -1;
+                    }
+                } else if (type == CLIPSYNC_MSG_TEXT) {
+                    if (handle_text_from_phone(st, 0, payload, len) < 0) {
+                        free(payload);
+                        return -1;
+                    }
                 } else if (type == CLIPSYNC_MSG_HELLO) {
                     /* version check ignored */
                 } else if (type == CLIPSYNC_MSG_PING) {
-                    net_send_msg(fd, CLIPSYNC_MSG_PONG, NULL, 0);
+                    if (net_send_msg(fd, CLIPSYNC_MSG_PONG, NULL, 0) < 0) {
+                        free(payload);
+                        return -1;
+                    }
                 } else if (type == CLIPSYNC_MSG_PONG) {
                     /* nothing */
                 } else if (type == CLIPSYNC_MSG_BYE) {
-                    keep = 0;
+                    free(payload);
+                    return -1;
                 }
                 free(payload);
-                if (!keep) break;
             }
         }
-        if (send_local_if_changed(&st) < 0) {
-            /* keep waiting for a working clipboard backend */
-        }
     }
-
-    free(st.last_local);
-    free(st.last_remote);
-    return 0;
 }
 
 static void usage(const char *prog) {
@@ -288,7 +411,36 @@ int main(int argc, char **argv) {
     fprintf(stderr, "clipsync pc listening on %s:%s (poll %d ms)\n", host, port, poll_ms);
     free(host); free(port);
 
+    /* Keep the sync state across phone disconnects so we do not blindly
+       re-send an unchanged PC clipboard every time the phone reconnects. */
+    struct state st;
+    memset(&st, 0, sizeof(st));
+    st.poll_ms = poll_ms;
+    st.prefer_local_on_tie = 1;
+
     for (;;) {
+        /* While no phone is connected, keep watching the PC clipboard so a
+           copy made during the outage is timestamped and queued for the next
+           successful connection. */
+        int rr = refresh_local_state(&st);
+        if (rr == -2) {
+            /* No clipboard backend yet; retry later. */
+        }
+
+        struct pollfd lpoll;
+        lpoll.fd = lfd;
+        lpoll.events = POLLIN;
+        lpoll.revents = 0;
+        int lpr = poll(&lpoll, 1, 1000);
+        if (lpr < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+        if (lpr == 0) continue;
+        if (lpoll.revents & (POLLERR | POLLHUP | POLLNVAL)) break;
+        if (!(lpoll.revents & POLLIN)) continue;
+
         int cfd = net_accept(lfd);
         if (cfd < 0) {
             if (errno == EINTR) continue;
@@ -296,10 +448,12 @@ int main(int argc, char **argv) {
             break;
         }
         fprintf(stderr, "phone connected\n");
-        handle_connection(cfd, poll_ms);
+        handle_connection(cfd, &st);
         close(cfd);
         fprintf(stderr, "phone disconnected\n");
     }
+    free(st.last_local);
+    free(st.last_remote);
     close(lfd);
     return 0;
 }
