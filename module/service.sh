@@ -3,6 +3,10 @@ MODDIR=${0%/*}
 BIN="$MODDIR/bin/clipsync"
 CONF="$MODDIR/clipsync.conf"
 
+# Some KernelSU/Magisk installers do not preserve the executable bit when
+# extracting the module.  Repair it here so the service survives reboots.
+chmod 755 "$BIN" 2>/dev/null || true
+
 # Wait for Android to finish booting before touching binder/clipboard.
 while [ "$(getprop sys.boot_completed)" != "1" ]; do
     sleep 2
