@@ -344,13 +344,26 @@ static int rd_string8(const uint8_t *d, size_t n, size_t *p, uint8_t **out, size
     *outlen = l;
     return 0;
 }
-static int rd_string16_skip(const uint8_t *d, size_t n, size_t *p) {
+static int rd_string16_is_text_mime(const uint8_t *d, size_t n, size_t *p, int *is_text) {
     uint32_t l;
     if (rd_u32(d, n, p, &l) != 0) return -1;
+    *is_text = 0;
     if (l == 0xffffffffu) return 0;
     size_t raw = (size_t)l * 2 + 2;
     size_t padded = align4(raw);
-    return rd_skip(d, n, p, padded);
+    if (*p + padded > n) return -1;
+    static const char prefix[] = "text/";
+    if (l >= 5) {
+        int match = 1;
+        for (size_t i = 0; i < 5; i++) {
+            uint16_t c;
+            memcpy(&c, d + *p + i * 2, 2);
+            if (c != (uint16_t)(unsigned char)prefix[i]) { match = 0; break; }
+        }
+        if (match) *is_text = 1;
+    }
+    *p += padded;
+    return 0;
 }
 static int rd_charsequence_label_skip(const uint8_t *d, size_t n, size_t *p) {
     uint32_t kind;
@@ -410,8 +423,17 @@ static int phone_clip_get(uint8_t **out, size_t *outlen) {
     if (rd_charsequence_label_skip(rep.data, rep.size, &p) != 0) goto bad;
     uint32_t n_mime = 0;
     if (rd_u32(rep.data, rep.size, &p, &n_mime) != 0) goto bad;
+    int has_text_mime = 0;
     for (uint32_t i = 0; i < n_mime; i++) {
-        if (rd_string16_skip(rep.data, rep.size, &p) != 0) goto bad;
+        int is_text = 0;
+        if (rd_string16_is_text_mime(rep.data, rep.size, &p, &is_text) != 0)
+            goto bad;
+        if (is_text) has_text_mime = 1;
+    }
+    if (!has_text_mime) {
+        /* Image-only (or other non-text) clipboards are not synchronized. */
+        binder_reply_free(&rep);
+        return 0;
     }
     if (skip_persistable_bundle(rep.data, rep.size, &p) != 0) goto bad;
     if (rd_skip(rep.data, rep.size, &p, 8) != 0) goto bad; /* timestamp */
@@ -500,6 +522,9 @@ static int phone_clip_set(const uint8_t *text, size_t len) {
 #define HEARTBEAT_INTERVAL_MS 5000u
 #define HEARTBEAT_TIMEOUT_MS 15000u
 #define TEXT_TS_OVERHEAD 8u
+#define RECONNECT_INITIAL_MS 1000
+#define RECONNECT_FAST_MAX_MS 16000
+#define RECONNECT_MAX_MS 60000
 
 struct sync_state {
     int fd;
@@ -747,7 +772,7 @@ static void phone_client_loop(const char *host, const char *port, int poll_ms) {
     memset(&st, 0, sizeof(st));
     st.prefer_local_on_tie = 0;
 
-    int retry_ms = 1000;
+    int retry_ms = RECONNECT_INITIAL_MS;
     for (;;) {
         /* Keep detecting local copies while PC is unreachable, so the
            reconnect sends the latest text with a useful timestamp. */
@@ -756,10 +781,13 @@ static void phone_client_loop(const char *host, const char *port, int poll_ms) {
         int fd = net_connect_tcp(host, port, 5000);
         if (fd < 0) {
             sleep_ms(retry_ms);
-            if (retry_ms < 10000) retry_ms *= 2;
+            if (retry_ms < RECONNECT_FAST_MAX_MS)
+                retry_ms *= 2;
+            else if (retry_ms < RECONNECT_MAX_MS)
+                retry_ms = RECONNECT_MAX_MS;
             continue;
         }
-        retry_ms = 1000;
+        retry_ms = RECONNECT_INITIAL_MS;
 
         fprintf(stderr, "connected to pc %s:%s\n", host, port);
         st.fd = fd;

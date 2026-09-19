@@ -4,7 +4,7 @@
 
 - Android 端：aarch64 静态二进制，可作为 KernelSU 模块服务运行。
 - PC 端：x86_64 静态二进制，支持 Wayland（`wl-clipboard`）和 X11（`xclip`）。
-- 传输：TCP，默认端口 `52345`，只同步 UTF-8 文本。
+- 传输：TCP，默认端口 `52345`，只同步 UTF-8 文本；图片等非文本剪贴板会被忽略。
 - 无认证 / 不加密，请仅在可信任局域网使用。
 
 ## 目录
@@ -89,14 +89,18 @@ su -c '/data/adb/modules/clipsync/bin/clipsync --set "hello from phone"'
 
 - Android 端以 uid 2000 (`com.android.shell`) 的身份直接读写 binder `clipboard` 服务，
   因此能稳定读取 Android 15/16 的剪贴板。
-- PC 端通过 `wl-paste` / `wl-copy`（或 `xclip`）读写剪贴板。
+- PC 端通过 `wl-paste` / `wl-copy`（或 `xclip`）读写剪贴板；读取时只请求
+  `text` / `UTF8_STRING` 类型，图片不会被当作文本同步。
+- Android 端会检查剪贴板 MIME 类型，只处理包含 `text/*` 类型的内容；
+  纯图片剪贴板会被跳过。
 - 两端轮询本地剪贴板（Android 默认 3 秒，PC 默认 300 ms），变化后通过简单 TCP 协议
   发送带时间戳的 `TEXT_TS` 消息；收到远端消息后先比较时间戳，较新的内容才覆盖本地，
   再通过“最近发送/最近接收”去重避免回环。
 - 同步状态会跨 TCP 会话保留，避免手机重新连上 WiFi 时两边盲目互发旧剪贴板。
 - 双方每 5 秒发送一次应用层心跳，15 秒收不到任何数据就主动断开重连；同时已启用
   `SO_KEEPALIVE`，用于兜底检测半开连接。
-- 手机端连接失败时按 1/2/4/…/10 秒退避重试；PC 重启、网络短暂断开后会自动恢复。
+- 手机端连接失败时按 1/2/4/8/16 秒退避重试，之后固定每 60 秒重试一次；
+  PC 重启、网络短暂断开后会自动恢复。
 
 ## 让 PC 端可靠地自动恢复
 

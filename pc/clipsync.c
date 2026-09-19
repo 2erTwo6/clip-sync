@@ -40,8 +40,11 @@ static int wayland_session(void) {
 }
 
 static const char *clip_get_cmd(void) {
-    if (wayland_session()) return "wl-paste -n 2>/dev/null";
-    if (getenv("DISPLAY")) return "xclip -selection clipboard -o 2>/dev/null";
+    /* Only ask for textual MIME types.  Otherwise wl-paste may fall back to
+       an offered image type and paste a screenshot as a huge binary blob. */
+    if (wayland_session()) return "wl-paste -n --type text 2>/dev/null";
+    if (getenv("DISPLAY"))
+        return "xclip -selection clipboard -o -t UTF8_STRING 2>/dev/null";
     return NULL;
 }
 
@@ -49,6 +52,24 @@ static const char *clip_set_cmd(void) {
     if (wayland_session()) return "wl-copy 2>/dev/null";
     if (getenv("DISPLAY")) return "xclip -selection clipboard -i 2>/dev/null";
     return NULL;
+}
+
+static int looks_like_image(const uint8_t *p, size_t n) {
+    /* Defensive fallback for clipboard backends that ignore the requested
+       MIME type.  These are the common signatures for screenshots/images. */
+    if (n >= 8 && memcmp(p, "\x89PNG\r\n\x1a\n", 8) == 0) return 1;
+    if (n >= 3 && p[0] == 0xff && p[1] == 0xd8 && p[2] == 0xff) return 1;
+    if (n >= 6 && (memcmp(p, "GIF87a", 6) == 0 || memcmp(p, "GIF89a", 6) == 0))
+        return 1;
+    if (n >= 12 && memcmp(p, "RIFF", 4) == 0 && memcmp(p + 8, "WEBP", 4) == 0)
+        return 1;
+    if (n >= 4 && (memcmp(p, "II*\0", 4) == 0 || memcmp(p, "MM\0*", 4) == 0))
+        return 1;
+    if (n >= 4 && p[0] == 0 && p[1] == 0 && p[2] == 1 && p[3] == 0) return 1;
+    if (n >= 14 && p[0] == 'B' && p[1] == 'M' &&
+        p[6] == 0 && p[7] == 0 && p[8] == 0 && p[9] == 0)
+        return 1;
+    return 0;
 }
 
 static int pc_clip_get(uint8_t **out, size_t *outlen) {
@@ -91,6 +112,10 @@ static int pc_clip_get(uint8_t **out, size_t *outlen) {
     if (len == 0) {
         free(buf);
         return 0;
+    }
+    if (looks_like_image(buf, len)) {
+        free(buf);
+        return 0; /* images are not synced */
     }
     *out = buf;
     *outlen = len;
